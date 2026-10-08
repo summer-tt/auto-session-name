@@ -1,0 +1,36 @@
+{
+  "name": "auto-session-name",
+  "version": "0.3.1",
+  "description": "Auto-generates short, descriptive session names for the pi coding agent using a configurable model",
+  "type": "module",
+  "license": "MIT",
+  "author": "TinySquid",
+  "keywords": [
+    "pi-package",
+    "pi-agent",
+    "pi-extension",
+    "session-name"
+  ],
+  "files": [
+    "auto-session-name.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/summer-tt/auto-session-name.git"
+  },
+  "homepage": "https://github.com/summer-tt/auto-session-name#readme",
+  "bugs": {
+    "url": "https://github.com/summer-tt/auto-session-name/issues"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./auto-session-name.ts"
+    ]
+  }
+}
