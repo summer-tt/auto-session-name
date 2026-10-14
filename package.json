@@ -24,6 +24,9 @@
   "bugs": {
     "url": "https://github.com/summer-tt/pi-auto-rename/issues"
   },
+  "scripts": {
+    "test": "node --experimental-strip-types --test --test-concurrency=1 test/*.test.mjs"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
