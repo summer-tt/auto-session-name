@@ -4,7 +4,7 @@
 
 > A cheap model turns your first prompt into a short, searchable name for each unnamed, persisted interactive [Pi](https://github.com/earendil-works/pi) session
 
-After the first turn, this extension takes your opening prompt, asks a small, configurable model to summarize it into a 3–8 word title, and sets it as the session name.
+When the first eligible user run starts, this extension sends your opening prompt to a small, configurable model to summarize it into a 3–8 word title. The naming response is not awaited; completion happens in the background and may happen while the first turn is still running.
 
 Without it, pi's `/resume` picker falls back to showing each session's raw first prompt — fine for a one-liner, useless when the opening message is a pasted stack trace, a long spec, or a skill invocation, since you only see a truncated fragment:
 
@@ -23,10 +23,10 @@ Debug flaky Vitest snapshot                     7 2d
 ## How it works
 
 ```text
-┌─────────────────┐  first prompt   ┌────────────────┐
-│  user's opening │ ──────────────▶ │  naming model  │
-│  prompt         │                 │  (configurable)│
-└─────────────────┘                 └───────┬────────┘
+┌─────────────────┐ first eligible run ┌────────────────┐
+│  user's opening │ ──────────────────▶ │  naming model  │
+│  prompt         │                     │ (configurable) │
+└─────────────────┘                     └───────┬────────┘
                                             │  3–8 word title
                     ┌───────────────────────▼────────┐
                     │ pi.setSessionName("Fix         │
@@ -34,12 +34,12 @@ Debug flaky Vitest snapshot                     7 2d
                     └────────────────────────────────┘
 ```
 
-- **When it fires** — in the interactive TUI only, once per session, on `agent_end` after the first turn, and only if the session has no name yet. `/reload` re-runs the extension but the existing-name guard prevents a second naming run.
-- **When it doesn't fire** — one-shot modes (`-p` / `--print`, `--mode json`, `--mode rpc`, and implicitly piped runs), `--no-session`, and any session that already has a name. That last guard is what makes explicit `--name <x>` respected: the user's name is never replaced.
+- **When it fires** — in the interactive TUI only, once per session, on `before_agent_start` of the first eligible user run, and only if the session has no name yet. Naming completes in the background; its response is not awaited. `/reload` re-runs the extension but the existing-name guard prevents a second naming run.
+- **When it doesn't fire** — one-shot modes (`-p` / `--print`, `--mode json`, `--mode rpc`, and implicitly piped runs), `--no-session`, and any session that already has a name. Sessions named with `--name <x>` before the run are skipped.
 - **Why interactive only** — one-shot runs are scripted; naming burns a model call per invocation and the sessions are usually throwaway. Named sessions only matter for the `/resume` picker, which people use interactively.
 - **Why a name** — named sessions are searchable in the `/resume` picker (and survive Ctrl+N's named-only filter), and the terminal title becomes `pi - <session name> - <cwd>` instead of just `pi - <cwd>`.
 - **Model pick** — uses the model pinned in the config file. Without a config, it picks the cheapest available model by input token cost (respecting session model scoping via `enabledModels` / `--models`), falling back to the active session model.
-- **Non-blocking** — naming runs in the background so the prompt is never delayed (it never delays anything: it only runs in the interactive TUI).
+- **Background naming** — the naming response is not awaited; the request runs in the background and may finish while the first turn is still running.
 - **One name per fresh session** — `/new` and `/fork` inside a TUI run reset the guard, so each fresh session gets its own naming run from its own first prompt.
 
 ## Install
@@ -70,7 +70,7 @@ Remove the package with:
 pi remove npm:@summer-tt/pi-auto-rename
 ```
 
-That's it — start a session, and after the first agent turn it gets a name. No commands, no flags.
+That's it — start a session, and its name is generated from the first eligible user run. No commands, no flags.
 
 ## Configuration
 
@@ -119,6 +119,8 @@ Missing keys are simply left unset (defaults apply).
 - The naming prompt requests a single-line plain-text title without Markdown, quotation marks, labels, or explanations; model compliance is not guaranteed.
 - Automatic titles are normalized at their boundaries: surrounding ASCII quotes and all boundary asterisks (even unpaired ones) are stripped, along with exact paired outer underscores (`_` or `__`), single or double backticks, and `~~`. Nested wrappers are stripped until stable. Internal characters are preserved; this is not a general Markdown parser, and fences or asymmetric non-asterisk wrappers are left alone. Boundary literals such as `C*`, `*.ts`, and `__init__` become `C`, `.ts`, and `init`.
 - An empty normalized result leaves the session unnamed, without another naming attempt in the same extension lifecycle. Explicit user names never pass through this normalization.
+- An explicit name is checked again immediately before a generated title is applied, and an in-flight naming request is aborted when the name changes (for example, via `/name`). Because the request may already have been dispatched at the start of the first run, setting `/name` during that run can still incur one cheap naming call; this accepted cost is the tradeoff for starting early.
+- Known limitations outside this change's scope: an explicit rename from another Pi process can race with this process's naming result; the naming request can contend with the main run for provider rate limits or quota; and an instantly aborted turn may still have a naming request dispatched.
 
 ## Origin and license
 
@@ -128,9 +130,12 @@ at commit `776a45e5f1a4508f1352c85855f257a310a26c3c` (extension version `0.3.1`)
 The original project is
 [`TinySquid/pi-agent-extensions`](https://github.com/TinySquid/pi-agent-extensions).
 
-The extension source is preserved unchanged, including the title-normalization
-fix from the summer-tt fork. Only packaging and documentation were adapted for
-this standalone distribution. The npm package published from this repository is
+At extraction (commit `776a45e5`, version `0.3.1`), the extension source was
+preserved unchanged, including the title-normalization fix from the summer-tt
+fork. Only packaging and documentation were adapted for this standalone
+distribution at that point. The early-naming trigger change (`before_agent_start`,
+deferred dispatch, and abort-on-explicit-name) was developed later on the
+`feat/early-naming` branch. The npm package published from this repository is
 `@summer-tt/pi-auto-rename`; it does not publish or replace the upstream npm
 package `@tinysquid/pi-auto-session-name`.
 
