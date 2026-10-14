@@ -444,7 +444,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", (event, ctx) => {
-    if (event.messageType !== "user") return;
+    // pi <1.2.0 has no messageType (all runs are user prompts there); treat a
+    // missing field as "user" so naming still fires on older hosts.
+    if ("messageType" in event && event.messageType !== "user") return;
     if (!event.prompt) return;
     if (ctx.mode !== "tui") return;
     if (isSessionNamed) return;
