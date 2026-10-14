@@ -1,4 +1,4 @@
-# auto-session-name
+# pi-auto-rename
 
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
@@ -45,7 +45,13 @@ Debug flaky Vitest snapshot                     7 2d
 ## Install
 
 ```bash
-pi install git:github.com/summer-tt/auto-session-name
+pi install npm:@summer-tt/pi-auto-rename
+```
+
+Alternatively, install directly from the Git repository:
+
+```bash
+pi install git:github.com/summer-tt/pi-auto-rename
 ```
 
 The repository root is a Pi package: `package.json` declares
@@ -61,7 +67,7 @@ pi install .
 Remove the package with:
 
 ```bash
-pi remove git:github.com/summer-tt/auto-session-name
+pi remove npm:@summer-tt/pi-auto-rename
 ```
 
 That's it — start a session, and after the first agent turn it gets a name. No commands, no flags.
@@ -124,7 +130,8 @@ The original project is
 
 The extension source is preserved unchanged, including the title-normalization
 fix from the summer-tt fork. Only packaging and documentation were adapted for
-this standalone Git installation source. This repository does not publish or
-replace the upstream npm package `@tinysquid/pi-auto-session-name`.
+this standalone distribution. The npm package published from this repository is
+`@summer-tt/pi-auto-rename`; it does not publish or replace the upstream npm
+package `@tinysquid/pi-auto-session-name`.
 
 MIT licensed; the original TinySquid copyright notice is preserved in [LICENSE](LICENSE).
