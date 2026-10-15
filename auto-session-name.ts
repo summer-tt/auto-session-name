@@ -14,7 +14,7 @@
  * -c/-r on a named session) are respected for free.
  *
  * The naming model and request options can be overridden via a global config
- * file: ~/.pi/agent/auto-session-name.json
+ * file: ~/.pi/agent/pi-auto-rename.json
  *   { "provider": "google", "model": "gemma-4-26b-a4b-it", "temperature": 0.2,
  *     "thinking": "off" }
  *
@@ -49,7 +49,7 @@ import {
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const CONFIG_FILE = "auto-session-name.json";
+const CONFIG_FILE = "pi-auto-rename.json";
 
 const THINKING_LEVELS = [
   "off",

@@ -74,7 +74,7 @@ That's it — start a session, and its name is generated from the first eligible
 
 ## Configuration
 
-Config file `~/.pi/agent/auto-session-name.json` pins the naming model and request options:
+Config file `~/.pi/agent/pi-auto-rename.json` pins the naming model and request options:
 
 ```json
 {
@@ -90,6 +90,24 @@ Config file `~/.pi/agent/auto-session-name.json` pins the naming model and reque
 - `thinking` — reasoning level for the naming request: `"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`. Defaults to `"off"`. The level is clamped to what the model supports (model-specific level mappings are respected).
 
 The file is read at naming time, so edits apply on the next session — no reload required. When a file is generated or repaired (see below), the rewrite is schema-normalizing: only `provider`, `model`, `temperature`, and `thinking` are kept, so any extra keys are dropped.
+
+### Upgrading from the old filename
+
+The configuration filename is now `pi-auto-rename.json`. The old
+`auto-session-name.json` is no longer read, modified, or automatically migrated.
+If you have an existing configuration, stop the Pi sessions that could write it,
+then manually move `~/.pi/agent/auto-session-name.json` to
+`~/.pi/agent/pi-auto-rename.json` before starting a new naming run. Move it only
+if the old file exists and the destination does not exist, including as a
+symbolic link. If both paths exist, keep both files and reconcile their contents
+manually; do not overwrite either file. Only the new file is used by this version.
+If you use a custom agent directory, perform the same filename change there;
+the directory is still resolved through Pi's `getAgentDir()`.
+
+If you do not migrate the old file and the new file is missing, an eligible
+naming run with an available model generates a new default configuration instead
+of using your old model selection. A malformed new file is repaired or
+regenerated using the existing rules, without falling back to the old file.
 
 ### Self-healing config
 

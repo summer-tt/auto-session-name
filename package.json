@@ -1,6 +1,6 @@
 {
   "name": "@summer-tt/pi-auto-rename",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Auto-generates short, descriptive session names for the pi coding agent using a configurable model",
   "type": "module",
   "license": "MIT",

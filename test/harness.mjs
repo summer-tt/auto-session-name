@@ -75,7 +75,7 @@ export function createHarness(t, options = {}) {
   const directory = mkdtempSync(join(testDirectory, ".tmp-agent-"));
   const config = {
     directory,
-    path: join(directory, "auto-session-name.json"),
+    path: join(directory, "pi-auto-rename.json"),
     reads: [],
     writes: [],
   };

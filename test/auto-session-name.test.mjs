@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createHarness, flushAsyncWork, responseWithTitle } from "./harness.mjs";
 
 // Test numbers track PROPOSAL.md's Test plan. Fixtures mutate global timers and
@@ -399,6 +401,95 @@ test("13. abort mitigation handles rejected and resolved aborts and cleans up al
       await h.resolveTitle("Previous request finally completes", 0);
       assert.equal(h.session.name, "New session manual title");
       assert.deepEqual(h.setNameAttempts, []);
+    });
+  }
+});
+
+test("config filename: only pi-auto-rename.json is read and written", serial, async (t) => {
+  const activeConfig = {
+    provider: "fixture-provider", model: "active", temperature: 0.2, thinking: "off",
+  };
+  const oldConfig = {
+    provider: "fixture-provider", model: "scoped", temperature: 0.9,
+  };
+  const invalidOptions = {
+    provider: "fixture-provider", model: "active",
+    temperature: "hot", thinking: "invalid-level",
+  };
+  const defaultConfig = { provider: "fixture-provider", model: "cheap" };
+  const repairedConfig = { provider: "fixture-provider", model: "active" };
+  const cases = [
+    {
+      name: "valid new config", value: activeConfig, kind: "valid",
+      expected: activeConfig,
+    },
+    {
+      name: "no config files", kind: "regen", expected: defaultConfig,
+    },
+    {
+      name: "invalid new JSON", value: "{ invalid JSON", kind: "regen",
+      expected: defaultConfig, invalid: true,
+    },
+    {
+      name: "invalid new options", value: invalidOptions, kind: "repair",
+      expected: repairedConfig, invalid: true,
+    },
+    {
+      name: "old config only", old: true, kind: "regen", expected: defaultConfig,
+    },
+    {
+      name: "both files use new config", old: true, value: activeConfig,
+      kind: "valid", expected: activeConfig,
+    },
+    {
+      name: "invalid new JSON never falls back to old config", old: true,
+      value: "{ invalid JSON", kind: "regen", expected: defaultConfig, invalid: true,
+    },
+    {
+      name: "new options repair never changes old config", old: true,
+      value: invalidOptions, kind: "repair", expected: repairedConfig, invalid: true,
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, serial, async (t) => {
+      const h = createHarness(t);
+      const newPath = join(h.config.directory, "pi-auto-rename.json");
+      const oldPath = join(h.config.directory, "auto-session-name.json");
+      const oldBytes = Buffer.from(`${JSON.stringify(oldConfig, null, 2)}\n`);
+      assert.equal(h.config.path, newPath);
+      if (scenario.old) writeFileSync(oldPath, oldBytes);
+      if (scenario.value !== undefined) h.seedConfig(scenario.value);
+      const beforeNew = existsSync(newPath) ? readFileSync(newPath) : undefined;
+
+      await h.startUser("Verify the renamed configuration path");
+      assertNoNaming(h);
+      await h.advanceTimers();
+
+      assert.equal(h.calls.length, 1);
+      const expectedModel = scenario.expected.model === "active" ? h.activeModel : h.cheapModel;
+      assert.equal(h.calls[0].model, expectedModel);
+      assert.equal(h.calls[0].options.temperature, scenario.expected.temperature);
+      assert.deepEqual(h.config.reads.map((entry) => entry.path), [newPath]);
+      const expectedWrites = scenario.kind === "valid" ? [] : [newPath];
+      assert.deepEqual(h.config.writes.map((entry) => entry.path), expectedWrites);
+      assert.deepEqual(h.readSavedConfig(), scenario.expected);
+      if (scenario.kind === "valid") {
+        assert.deepEqual(readFileSync(newPath), beforeNew, "valid new config must not be rewritten");
+        assert.equal(h.warnings.length, 0);
+      } else {
+        assert.ok(h.warnings.some(([message]) => message.includes("pi-auto-rename.json")));
+      }
+      if (scenario.invalid) {
+        assert.ok(h.warnings.some(([message]) => message.includes("invalid pi-auto-rename.json")));
+      }
+      assert.equal(existsSync(oldPath), Boolean(scenario.old));
+      if (scenario.old) {
+        assert.deepEqual(readFileSync(oldPath), oldBytes, "old config bytes must stay unchanged");
+      }
+      await h.resolveTitle("Configuration filename regression verified");
+      assert.equal(h.session.name, "Configuration filename regression verified");
+      assertListenerRemoved(h);
     });
   }
 });
