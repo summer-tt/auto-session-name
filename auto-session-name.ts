@@ -30,16 +30,11 @@
 
 import {
   clampThinkingLevel,
-  type AnthropicOptions,
+  isRetryableAssistantError,
+  isContextOverflow,
   type Api,
-  type AzureOpenAIResponsesOptions,
-  type GoogleApiThinkingLevel,
-  type GoogleOptions,
-  type GoogleVertexOptions,
+  type AssistantMessage,
   type Model,
-  type OpenAICompletionsOptions,
-  type OpenAIResponsesOptions,
-  type StreamOptions,
 } from "@earendil-works/pi-ai";
 import {
   getAgentDir,
@@ -249,211 +244,271 @@ const pickModel = (
   return ctx.model;
 };
 
-/** Per-API stream option shapes pi-ai's `complete()` accepts. */
-type ApiOptions =
-  | AnthropicOptions
-  | GoogleOptions
-  | GoogleVertexOptions
-  | OpenAIResponsesOptions
-  | OpenAICompletionsOptions
-  | AzureOpenAIResponsesOptions
-  | StreamOptions;
+// One task per extension lifecycle. A reload/resume may start a fresh task.
+const MAX_ATTEMPTS = 3;
+const ATTEMPT_TIMEOUT_MS = 20_000;
+const TASK_DEADLINE_MS = 60_000;
+const BASE_DELAY_MS = 1_000;
 
-const OPENAI_APIS = [
-  "openai-responses",
-  "openai-completions",
-  "azure-openai-responses",
-] as const;
-
-const isOpenAiApi = (api: Api): boolean =>
-  (OPENAI_APIS as readonly string[]).includes(api);
-
-/**
- * Build per-API request options for the naming call.
- *
- * - temperature: passed through as-is when configured; otherwise omitted
- *   (adapters guard provider-specific temperature support internally; note
- *   Anthropic drops it when thinking is enabled).
- * - thinking: defaults to "off". The configured level is clamped to the
- *   model's supported levels with pi-ai's clampThinkingLevel, so model
- *   capability and thinkingLevelMap overrides are respected. "off" disables
- *   thinking explicitly for reasoning-capable models (some APIs default
- *   reasoning on); unknown APIs disable by omission.
- */
-const buildRequestOptions = (
-  model: Model<Api>,
-  config: NameConfig | undefined,
-): ApiOptions => {
-  const options: StreamOptions = {};
-
-  if (config?.temperature !== undefined) {
-    options.temperature = config.temperature;
-  }
-
-  const level = clampThinkingLevel(model, config?.thinking ?? "off");
-  if (level === "off") {
-    if (!model.reasoning) {
-      return options;
-    }
-
-    switch (model.api) {
-      case "anthropic-messages":
-        return { ...options, thinkingEnabled: false };
-      case "google-generative-ai":
-      case "google-vertex":
-        return { ...options, thinking: { enabled: false } };
-      default:
-        // OpenAI-family reasoning models default reasoning on; the raw
-        // request path needs an explicit minimal effort to disable it.
-        return isOpenAiApi(model.api)
-          ? { ...options, reasoningEffort: "minimal" }
-          : options;
-    }
-  }
-
-  switch (model.api) {
-    case "anthropic-messages":
-      // Anthropic has no "minimal" effort
-      return {
-        ...options,
-        thinkingEnabled: true,
-        effort: level === "minimal" ? "low" : level,
-      };
-    case "google-generative-ai":
-    case "google-vertex": {
-      // Respect model-specific level mappings (e.g. gemma-4 maps medium to HIGH)
-      const mapped = model.thinkingLevelMap?.[level];
-      const googleLevel = (
-        typeof mapped === "string" ? mapped : level
-      ).toUpperCase() as GoogleApiThinkingLevel;
-
-      return { ...options, thinking: { enabled: true, level: googleLevel } };
-    }
-    default:
-      return isOpenAiApi(model.api)
-        ? {
-            ...options,
-            reasoningEffort:
-              level === "xhigh" || level === "max" ? "high" : level,
-          }
-        : options;
-  }
+type TaskState = "idle" | "running" | "waiting-retry" | "named" | "failed" | "cancelled";
+type NamingTask = {
+  state: TaskState;
+  sessionId: string;
+  sessionFile: string;
+  prompt: string;
+  controller: AbortController;
+  attempt?: AbortController;
+  deferTimer?: ReturnType<typeof setTimeout>;
+  deadlineTimer?: ReturnType<typeof setTimeout>;
+  stopListening?: () => void;
+  deadline: number;
+  expired: boolean;
 };
 
-const generateSessionName = async (
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  prompt: string,
-  listenForNameChange: (controller: AbortController) => () => void,
-) => {
+class NamingInterrupted extends Error {
+  readonly kind: "cancelled" | "timeout";
+  constructor(kind: "cancelled" | "timeout") {
+    super(kind);
+    this.kind = kind;
+  }
+}
+
+// Do not log provider text: it may echo credentials or the original prompt.
+// Categories are deliberately fixed strings, not truncated untrusted messages.
+const errorCategory = (message: string): string => {
+  if (/insufficient_quota|quota.?exceeded|billing|out of budget|usage.limit|available balance/i.test(message)) return "quota/billing limit";
+  if (/unsupported_value|invalid_request|bad request|unsupported parameter|model.not.found|no api key|unauthorized|forbidden|authentication/i.test(message)) return "invalid request/auth/model";
+  // Only explicit status formats count. A parameter value such as <= 500 is
+  // not a status code. Known permanent errors override the SDK's heuristics.
+  if (/(?:^\s*|HTTP\s+|status(?:\s+code)?\s*[:=]?\s*)(?:400|401|402|403|404|405|413|422)\b/i.test(message) ||
+      /\((?:400|401|402|403|404|405|413|422)\)/.test(message)) return "permanent HTTP error";
+  return "provider/transport error";
+};
+
+const retryableResponse = (response: AssistantMessage): boolean =>
+  !isContextOverflow(response) &&
+  errorCategory(response.errorMessage ?? "") === "provider/transport error" &&
+  isRetryableAssistantError(response);
+
+// A local race enforces the bound even when a provider ignores abort. Both
+// branches of the original Promise remain handled after this wait finishes.
+const boundedAttempt = async (
+  task: NamingTask,
+  produce: (signal: AbortSignal) => Promise<AssistantMessage>,
+): Promise<AssistantMessage> => {
   const controller = new AbortController();
-  let stopListening: (() => void) | undefined;
-  try {
-    const read = readConfig();
-
-    const config = read.status === "regen" ? undefined : read.config;
-    const model = pickModel(ctx, config);
-
-    if (!model) {
-      console.warn(
-        "[auto-session-name] no model available; skipping session naming",
-      );
+  task.attempt = controller;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onCancel: () => void = () => {};
+  const interrupted = new Promise<never>((_, reject) => {
+    onCancel = () => {
+      reject(new NamingInterrupted("cancelled"));
+      controller.abort();
+    };
+    task.controller.signal.addEventListener("abort", onCancel, { once: true });
+    if (task.controller.signal.aborted) {
+      onCancel();
       return;
     }
-    if (read.status === "regen") {
-      writeDefaultConfig(model);
-    } else if (read.status === "repair") {
-      // Keep the user's model choice; rewrite without the invalid fields only
-      writeConfigFile(
-        read.config,
-        `rewrote ${CONFIG_FILE} without invalid fields (provider "${read.config.provider}", model "${read.config.model}" kept)`,
-      );
-    }
-
-    stopListening = listenForNameChange(controller);
-    const response = await ctx.modelRegistry.complete(
-      model,
-      {
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "text", text: sessionNamePrompt(prompt) }],
-            timestamp: Date.now(),
-          },
-        ],
-      },
-      // opencode gateways reject a request without a session id (400
-      // MissingSessionID); pi-ai derives x-opencode-session from this option.
-      {
-        ...buildRequestOptions(model, config),
-        sessionId: ctx.sessionManager?.getSessionId?.(),
-        signal: controller.signal,
-      },
-    );
-
-    // Model output is untrusted: keep text blocks and normalize title boundaries
-    const rawTitle = response.content
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text)
-      .join("");
-    const title = normalizeSessionName(rawTitle);
-
-    if (!title) return;
-    if (controller.signal.aborted) return;
-    // Do not treat our own session_info_changed event as an explicit rename.
-    stopListening?.();
-    stopListening = undefined;
-    if (pi.getSessionName()) return; // user named it while naming was in flight
-    pi.setSessionName(title);
-  } catch (err) {
-    if (!controller.signal.aborted) {
-      console.warn("[auto-session-name] failed to generate session name:", err);
-    }
+    timer = setTimeout(() => {
+      // Settle the local timeout before abort can reject the transport.
+      reject(new NamingInterrupted("timeout"));
+      controller.abort();
+    }, Math.max(0, Math.min(ATTEMPT_TIMEOUT_MS, task.deadline - Date.now())));
+  });
+  try {
+    if (task.controller.signal.aborted) throw new NamingInterrupted("cancelled");
+    return await Promise.race([Promise.resolve().then(() => {
+      if (controller.signal.aborted) throw new NamingInterrupted("cancelled");
+      return produce(controller.signal);
+    }), interrupted]);
   } finally {
-    stopListening?.();
+    clearTimeout(timer);
+    task.controller.signal.removeEventListener("abort", onCancel);
+    if (task.attempt === controller) task.attempt = undefined;
   }
 };
 
-/**
- * /reload re-runs the extension; the getSessionName() guard prevents a second
- * naming run (pi does not set a session name by default)
- */
-export default function (pi: ExtensionAPI) {
-  let isSessionNamed = false;
-  let activeListener: (() => void) | undefined;
-
-  const listenForNameChange = (controller: AbortController): (() => void) => {
-    const off = pi.on("session_info_changed", () => {
-      stopListening();
-      controller.abort();
-    });
-    const stopListening = () => {
-      off();
-      if (activeListener === stopListening) activeListener = undefined;
+const backoff = (task: NamingTask, delay: number): Promise<void> =>
+  new Promise((resolve, reject) => {
+    const onCancel = () => {
+      clearTimeout(timer);
+      task.controller.signal.removeEventListener("abort", onCancel);
+      reject(new NamingInterrupted("cancelled"));
     };
-    activeListener = stopListening;
-    return stopListening;
-  };
-
-  // /new or /fork starts a fresh session; detach the previous request's listener.
-  pi.on("session_start", (event) => {
-    if (event.reason !== "new" && event.reason !== "fork") return;
-
-    activeListener?.();
-    isSessionNamed = false;
+    const timer = setTimeout(() => {
+      task.controller.signal.removeEventListener("abort", onCancel);
+      resolve();
+    }, delay);
+    task.controller.signal.addEventListener("abort", onCancel, { once: true });
+    if (task.controller.signal.aborted) onCancel();
   });
 
-  pi.on("before_agent_start", (event, ctx) => {
-    // pi <1.2.0 has no messageType (all runs are user prompts there); treat a
-    // missing field as "user" so naming still fires on older hosts.
-    if ("messageType" in event && event.messageType !== "user") return;
-    if (!event.prompt) return;
-    if (ctx.mode !== "tui") return;
-    if (isSessionNamed) return;
-    if (pi.getSessionName()) return;
-    if (ctx.sessionManager.getSessionFile() === undefined) return; // --no-session
+export default function (pi: ExtensionAPI) {
+  let active: NamingTask | undefined;
 
-    isSessionNamed = true; // optimistic: one attempt per fresh session
-    setTimeout(() => void generateSessionName(pi, ctx, event.prompt, listenForNameChange), 0);
+  const cleanup = (task: NamingTask) => {
+    clearTimeout(task.deferTimer);
+    clearTimeout(task.deadlineTimer);
+    task.stopListening?.();
+    task.stopListening = undefined;
+  };
+  const cancel = (task: NamingTask) => {
+    if (task.state === "named" || task.state === "failed" || task.state === "cancelled") return;
+    task.state = "cancelled"; // Invalidate locally before touching runtime resources.
+    task.controller.abort();
+    cleanup(task);
+  };
+  const current = (task: NamingTask, ctx: ExtensionContext): boolean => {
+    // Never touch a disposed extension API just to discover that it is stale.
+    if (active !== task || task.controller.signal.aborted ||
+        task.state === "cancelled" || task.state === "failed" || task.state === "named") return false;
+    if (Date.now() >= task.deadline) {
+      task.expired = true;
+      task.controller.abort();
+      return false;
+    }
+    if (ctx.sessionManager.getSessionId() !== task.sessionId ||
+        ctx.sessionManager.getSessionFile() !== task.sessionFile || pi.getSessionName()) {
+      cancel(task);
+      return false;
+    }
+    return true;
+  };
+
+  const run = async (task: NamingTask, ctx: ExtensionContext) => {
+    let label = "unselected model";
+    const warn = (reason: string) => console.warn(
+      `[auto-session-name] failed to generate session name (${label}): ${reason}. Fix configuration if needed, /reload, then send a user prompt to try again`,
+    );
+    try {
+      if (!current(task, ctx)) return;
+      // Configuration and model selection happen once, behind the initial defer.
+      const read = readConfig();
+      const config = read.status === "regen" ? undefined : read.config;
+      const model = pickModel(ctx, config);
+      if (!model) {
+        warn("no model available");
+        task.state = "failed";
+        return;
+      }
+      label = `${model.provider}/${model.id}`;
+      if (read.status === "regen") writeDefaultConfig(model);
+      else if (read.status === "repair") {
+        writeConfigFile(read.config, `rewrote ${CONFIG_FILE} without invalid fields`);
+      }
+      const level = clampThinkingLevel(model, config?.thinking ?? "off");
+      const options = {
+        temperature: config?.temperature,
+        reasoning: level === "off" ? undefined : level,
+        sessionId: task.sessionId,
+        maxRetries: 0,
+      };
+      const context = {
+        messages: [{
+          role: "user" as const,
+          content: [{ type: "text" as const, text: sessionNamePrompt(task.prompt) }],
+          timestamp: Date.now(),
+        }],
+      };
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        if (!current(task, ctx)) return;
+        task.state = "running";
+        let retry = false;
+        let reason = "provider/transport error";
+        try {
+          const response = await boundedAttempt(task, (signal) =>
+            ctx.modelRegistry.streamSimple(model, context, { ...options, signal }).result(),
+          );
+          if (!current(task, ctx)) return;
+          if (response.stopReason === "error") {
+            reason = isContextOverflow(response) ? "context overflow" : errorCategory(response.errorMessage ?? "");
+            retry = retryableResponse(response);
+          } else if (response.stopReason !== "stop") {
+            // Unexpected provider aborts and incomplete outputs are observable.
+            reason = response.stopReason === "aborted" ? "unexpected provider abort" : "incomplete response";
+          } else {
+            const raw = response.content
+              .filter((c): c is { type: "text"; text: string } => c.type === "text")
+              .map((c) => c.text).join("");
+            const title = normalizeSessionName(raw);
+            if (title) {
+              if (!current(task, ctx)) return;
+              task.stopListening?.();
+              task.stopListening = undefined;
+              pi.setSessionName(title);
+              task.state = "named";
+              return;
+            }
+            reason = "empty title";
+          }
+        } catch (error) {
+          if (task.controller.signal.aborted || active !== task) return;
+          if (error instanceof NamingInterrupted && error.kind === "timeout") {
+            reason = "request timeout";
+            retry = true;
+          } else {
+            // Unknown thrown/programming errors are not safely retryable.
+            reason = "request exception";
+          }
+        }
+        if (!current(task, ctx)) return;
+        if (!retry || attempt === MAX_ATTEMPTS) {
+          warn(`${reason}; attempts ${attempt}/${MAX_ATTEMPTS}`);
+          task.state = "failed";
+          return;
+        }
+        const delay = BASE_DELAY_MS * 2 ** (attempt - 1);
+        task.state = "waiting-retry";
+        console.warn(`[auto-session-name] ${label}: attempt ${attempt}/${MAX_ATTEMPTS} failed (${reason}); retry in ${delay}ms`);
+        await backoff(task, delay);
+      }
+    } catch {
+      if (!task.controller.signal.aborted && active === task) {
+        warn("unexpected naming exception");
+        task.state = "failed";
+      }
+    } finally {
+      if (task.expired && active === task && task.state !== "cancelled") {
+        warn("task deadline exceeded");
+        task.state = "failed";
+      }
+      cleanup(task);
+    }
+  };
+
+  pi.on("session_shutdown", () => {
+    if (active) cancel(active);
+  });
+  pi.on("session_start", () => {
+    if (active) cancel(active);
+    active = undefined;
+  });
+  pi.on("before_agent_start", (event, ctx) => {
+    if ("messageType" in event && event.messageType !== "user") return;
+    if (!event.prompt || ctx.mode !== "tui" || active || pi.getSessionName()) return;
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    if (sessionFile === undefined) return;
+    if (typeof ctx.modelRegistry.streamSimple !== "function") {
+      console.warn("[auto-session-name] naming requires a host with modelRegistry.streamSimple (tested on Pi 1.3.0)");
+      return;
+    }
+    const task: NamingTask = {
+      state: "idle",
+      sessionId: ctx.sessionManager.getSessionId(),
+      sessionFile,
+      prompt: event.prompt,
+      controller: new AbortController(),
+      deadline: Date.now() + TASK_DEADLINE_MS,
+      expired: false,
+    };
+    active = task;
+    // Cover the initial defer and all backoffs, not only an in-flight request.
+    task.stopListening = pi.on("session_info_changed", () => cancel(task));
+    task.deadlineTimer = setTimeout(() => {
+      task.expired = true;
+      task.controller.abort();
+    }, TASK_DEADLINE_MS);
+    task.deferTimer = setTimeout(() => { void run(task, ctx); }, 0);
   });
 }

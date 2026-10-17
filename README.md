@@ -34,13 +34,13 @@ Debug flaky Vitest snapshot                     7 2d
                     └────────────────────────────────┘
 ```
 
-- **When it fires** — in the interactive TUI only, once per session, on `before_agent_start` of the first eligible user run, and only if the session has no name yet. Naming completes in the background; its response is not awaited. `/reload` re-runs the extension but the existing-name guard prevents a second naming run.
+- **When it fires** — in the interactive TUI only, on `before_agent_start` of the first eligible user run, and only if the session has no name yet. One background naming task is allowed per extension lifecycle, with at most three model calls for transient failures. Later user messages neither start parallel tasks nor reset the budget. `/reload` re-runs the extension but the existing-name guard prevents renaming.
 - **When it doesn't fire** — one-shot modes (`-p` / `--print`, `--mode json`, `--mode rpc`, and implicitly piped runs), `--no-session`, and any session that already has a name. Sessions named with `--name <x>` before the run are skipped.
 - **Why interactive only** — one-shot runs are scripted; naming burns a model call per invocation and the sessions are usually throwaway. Named sessions only matter for the `/resume` picker, which people use interactively.
 - **Why a name** — named sessions are searchable in the `/resume` picker (and survive Ctrl+N's named-only filter), and the terminal title becomes `pi - <session name> - <cwd>` instead of just `pi - <cwd>`.
 - **Model pick** — uses the model pinned in the config file. Without a config, it picks the cheapest available model by input token cost (respecting session model scoping via `enabledModels` / `--models`), falling back to the active session model.
 - **Background naming** — the naming response is not awaited; the request runs in the background and may finish while the first turn is still running.
-- **One name per fresh session** — `/new` and `/fork` inside a TUI run reset the guard, so each fresh session gets its own naming run from its own first prompt.
+- **Session ownership** — quitting, reloading, or replacing the session cancels its task. An unnamed session after startup, reload, new, resume, or fork can start a new task on its next eligible user prompt. Old prompts and late responses never transfer to another session.
 
 ## Install
 
@@ -53,6 +53,11 @@ Alternatively, install directly from the Git repository:
 ```bash
 pi install git:github.com/summer-tt/pi-auto-rename
 ```
+
+Tested with Pi **1.3.0**. The host must provide `modelRegistry.streamSimple`,
+`isRetryableAssistantError`, and the documented session lifecycle events.
+Older hosts are not covered by the compatibility guarantee. Host peer dependencies
+remain `"*"` as required by Pi packaging; this is not an all-version support claim.
 
 The repository root is a Pi package: `package.json` declares
 `pi.extensions: ["./auto-session-name.ts"]`. Pi loads the TypeScript source
@@ -89,7 +94,10 @@ Config file `~/.pi/agent/pi-auto-rename.json` pins the naming model and request 
 - `temperature` — sampling temperature passed to the naming request as-is. Must be between 0 and 2; values outside that range (or non-numbers) are treated as malformed and repaired away. Omitted by default (provider default applies). Providers may drop it where they forbid it (Anthropic ignores it when thinking is enabled, and only accepts 0–1).
 - `thinking` — reasoning level for the naming request: `"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`. Defaults to `"off"`. The level is clamped to what the model supports (model-specific level mappings are respected).
 
-The file is read at naming time, so edits apply on the next session — no reload required. When a file is generated or repaired (see below), the rewrite is schema-normalizing: only `provider`, `model`, `temperature`, and `thinking` are kept, so any extra keys are dropped.
+The file is read once before the task's first request. Retries reuse the same prompt,
+model choice, and request options; authentication is still resolved by the registry
+for each call. Edits apply to the next task. After a terminal failure, fix the
+configuration, run `/reload`, and send a user prompt to start a new task. When a file is generated or repaired (see below), the rewrite is schema-normalizing: only `provider`, `model`, `temperature`, and `thinking` are kept, so any extra keys are dropped.
 
 ### Upgrading from the old filename
 
@@ -128,6 +136,31 @@ Missing keys are simply left unset (defaults apply).
 > [!NOTE]
 > A configured model that is unknown or has no configured credentials falls back to the default pick (with a warning).
 
+## Retries and time limits
+
+- At most **3 model calls** per task (first call plus 2 retries), with **1s / 2s**
+  backoff. Provider retries are disabled through `maxRetries: 0`.
+- Each attempt is bounded to **20s**, and the whole task to **60s** from task
+  creation, including defer and backoff. The total deadline takes priority, so
+  not all three calls are guaranteed. These limits are constants, not JSON options.
+- Only recognized transient provider/transport errors and local attempt timeouts
+  retry. Known bad requests, authentication/permission errors, model-selection
+  errors, quota/billing limits, unknown exceptions, and empty/incomplete results
+  terminate. Classification is conservative and partly text-based, not a universal
+  HTTP error parser.
+- Main-turn failure or cancellation does not cancel independent naming. Session
+  shutdown, replacement, reload, and explicit naming do; these cancellations are
+  silent. Unexpected provider aborts and task deadline exhaustion warn.
+- Warnings report fixed error categories rather than provider response bodies,
+  prompts, or credentials. Terminal failure does not grant a fresh budget on the
+  next message; use `/reload` after correcting the problem.
+- A provider that ignores abort may continue an old request while the extension
+  retries. Late results are discarded and late rejections are handled. The budget
+  counts extension model calls, not every OAuth refresh, virtual-model route, or
+  custom-provider HTTP request; it does not guarantee at-most-once billing.
+- There is no automatic model switching during retries, persistent retry progress,
+  or batch backfill of older unnamed sessions.
+
 ## Behavior notes
 
 - Naming is best-effort. Quitting, switching sessions, or reloading before the background request finishes can prevent the name from being applied.
@@ -136,8 +169,8 @@ Missing keys are simply left unset (defaults apply).
 - The naming call passes the session id, which opencode gateways require: without it they reject the call with `400 MissingSessionID` and the session silently stays unnamed (pi-ai derives `x-opencode-session` from it since 0.87.1).
 - The naming prompt requests a single-line plain-text title without Markdown, quotation marks, labels, or explanations; model compliance is not guaranteed.
 - Automatic titles are normalized at their boundaries: surrounding ASCII quotes and all boundary asterisks (even unpaired ones) are stripped, along with exact paired outer underscores (`_` or `__`), single or double backticks, and `~~`. Nested wrappers are stripped until stable. Internal characters are preserved; this is not a general Markdown parser, and fences or asymmetric non-asterisk wrappers are left alone. Boundary literals such as `C*`, `*.ts`, and `__init__` become `C`, `.ts`, and `init`.
-- An empty normalized result leaves the session unnamed, without another naming attempt in the same extension lifecycle. Explicit user names never pass through this normalization.
-- An explicit name is checked again immediately before a generated title is applied, and an in-flight naming request is aborted when the name changes (for example, via `/name`). Because the request may already have been dispatched at the start of the first run, setting `/name` during that run can still incur one cheap naming call; this accepted cost is the tradeoff for starting early.
+- Only a complete `stop` response with a nonempty normalized title can name a session. Errors, aborts, empty titles, and incomplete responses are never used, even if they contain partial text. Empty or incomplete results warn and terminate without retry. Explicit user names never pass through normalization.
+- An explicit name is checked again immediately before a generated title is applied. Any observed naming metadata change (including clearing the name) cancels the task, during the initial defer, a request, or backoff. This also applies to changes made by other extensions. A dispatched request may still incur a charge; abort is best-effort.
 - Known limitations outside this change's scope: an explicit rename from another Pi process can race with this process's naming result; the naming request can contend with the main run for provider rate limits or quota; and an instantly aborted turn may still have a naming request dispatched.
 
 ## Origin and license

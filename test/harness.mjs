@@ -71,7 +71,7 @@ export async function flushAsyncWork() {
 
 export function createHarness(t, options = {}) {
   // Install before invoking the extension factory, not after registration.
-  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
   const directory = mkdtempSync(join(testDirectory, ".tmp-agent-"));
   const config = {
     directory,
@@ -115,7 +115,7 @@ export function createHarness(t, options = {}) {
       registryCalls.getAvailable.push(true);
       return options.availableModels ?? models;
     },
-    complete(model, context, requestOptions) {
+    streamSimple(model, context, requestOptions) {
       const deferred = Promise.withResolvers();
       const signal = requestOptions.signal;
       const call = {
@@ -144,7 +144,7 @@ export function createHarness(t, options = {}) {
       if (signal?.aborted) onAbort();
       // Do not attach a harness catch: an extension missing its own catch must
       // fail node:test's unhandled-rejection checks.
-      return deferred.promise;
+      return { result: () => deferred.promise };
     },
   };
 
@@ -273,6 +273,7 @@ export function createHarness(t, options = {}) {
     async resetSession(reason, { replaceRuntime = false } = {}) {
       const previousRuntime = h.runtime;
       const previousSessionFile = h.session.file;
+      await h.emit("session_shutdown", { reason });
       if (replaceRuntime) {
         previousRuntime.active = false;
         previousRuntime.handlers.clear();
@@ -284,8 +285,8 @@ export function createHarness(t, options = {}) {
       await h.emit("session_start", { reason, previousSessionFile });
       return previousRuntime;
     },
-    async advanceTimers() {
-      t.mock.timers.tick(0);
+    async advanceTimers(ms = 0) {
+      t.mock.timers.tick(ms);
       await flushAsyncWork();
     },
     async resolveTitle(title, index = calls.length - 1) {
@@ -296,6 +297,7 @@ export function createHarness(t, options = {}) {
   };
 
   t.after(async () => {
+    await h.emit("session_shutdown", { reason: "quit" });
     // Resolve leftovers without attaching a rejection handler or starting any
     // queued timer, then restore globals and delete only this test's directory.
     for (const call of calls) call.resolve(responseWithTitle(""));
